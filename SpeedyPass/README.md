@@ -73,7 +73,7 @@ The `validate` function takes a string and ensures the following:
 * The first and last character of the string are alphanumeric.
 * Any spaces are removed from the string.
 * "Dangerous" characters and strings are blocked.
-  * ``, ", \n, \r, |, #, ;, &, flag`
+  * \`, ", \n, \r, |, #, ;, &, flag
 
 The python script checks for certain rules for the password.
 
