@@ -1,0 +1,422 @@
+#!/usr/bin/env python2.7
+from datetime import datetime
+from flask import Flask, g, redirect, render_template_string, request, session, url_for
+from jinja2.exceptions import TemplateError
+import sqlite3
+
+app = Flask(__name__)
+app.config.from_pyfile('config.py')
+
+def _db():
+    return sqlite3.connect('speedymail.db')
+
+def db():
+    db = getattr(g, '_database', None)
+    if db is None:
+        db = g._database = _db()
+    return db
+
+@app.teardown_appcontext
+def teardown_db(exception):
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.close()
+
+HEADER = '''
+<!doctype html5>
+<html>
+    <head>
+        <title>SpeedyMail</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <link rel="stylesheet" href="/static/css/bulma.min.css">
+        <link rel="stylesheet" href="/static/css/font-awesome.min.css">
+        <link rel="stylesheet" href="/static/css/noto-sans.css">
+    </head>
+    <body>
+        <section class="hero is-primary">
+            <div class="hero-body">
+                <div class="container">
+                    <h1 class="title">
+                        SpeedyMail
+                    </h1>
+                    <h2 class="subtitle">
+                        Faster and with none of the security.
+                    </h2>
+                </div>
+            </div>
+        </section>
+        <section class="section">
+            <div class="container">
+'''
+MAIN_HEADER = HEADER + '''
+<div class="columns">
+    <div class="column is-one-quarter">
+        <aside class="menu">
+            <p class="menu-label">
+                {{ user.name }}
+            </p>
+            <ul class="menu-list">
+                <li><a href="/">Inbox</a></li>
+                <li><a href="/compose">Compose</a></li>
+                <li><a href="/logout">Log out</a></li>
+            </ul>
+        </aside>
+    </div>
+    <div class="column">
+'''
+
+FOOTER = '''
+            </div>
+        </section>
+    </body>
+</html>
+'''
+MAIN_FOOTER = '''
+    </div>
+</div>
+''' + FOOTER
+
+def get_user():
+    user_id = session.get('user_id', None)
+    if user_id is None:
+        return None
+    c = db().cursor()
+    c.execute('SELECT name, username FROM users WHERE id = %d' % (user_id))
+    row = c.fetchone()
+    db().commit()
+    if row is None:
+        return None
+    return {
+        'id': user_id,
+        'name': row[0],
+        'username': row[1]
+    }
+
+def render_error(e):
+    return render_template_string(HEADER + '''
+<div class="columns">
+    <div class="column is-half is-offset-one-quarter">
+        <h1 class="title">Internal Server Error</h1>
+        <p>{{ error }}</p>
+    </div>
+</div>
+''' + FOOTER, error=e), 500, []
+
+@app.errorhandler(sqlite3.DatabaseError)
+def handle_db_error(e):
+    return render_error('SQL error.')
+
+@app.errorhandler(TemplateError)
+def handle_template_error(e):
+    return render_error('Template error.')
+
+@app.errorhandler(Exception)
+def handle_generic_error(e):
+    return render_error('Unknown error.')
+
+@app.route('/logout')
+def logout():
+    session.pop('user_id', None)
+    return redirect(url_for('index'))
+
+@app.route('/')
+def index():
+    user = get_user()
+    if user is None:
+        return redirect(url_for('login'))
+    c = db().cursor()
+    q = request.args.get('q', '')
+    c.execute('SELECT date, subject, users.name, messages.id FROM messages JOIN users ON messages.from_user_id = users.id WHERE to_user_id = "%d" AND subject LIKE "%%%s%%"' % (user['id'], q))
+    messages = [{
+        'date': datetime.strptime(x[0], '%Y-%m-%d %H:%M:%S'),
+        'subject': x[1],
+        'from': x[2],
+        'id': x[3],
+    } for x in c.fetchall()]
+    return render_template_string(MAIN_HEADER + '''
+<h1 class="title">Inbox</h1>
+<form>
+    <div class="field">
+        <div class="control has-icons-left">
+            <input class="input" type="text" name="q" placeholder="Search">
+            <span class="icon is-small is-left">
+                <i class="fa fa-search"></i>
+            </span>
+        </div>
+    </div>
+</form>
+<table class="table is-fullwidth">
+    <thead>
+        <tr>
+            <th width="5%"></th>
+            <th width="20%">Date</th>
+            <th width="20%">From</th>
+            <th>Subject</th>
+        </tr>
+    </thead>
+    <tbody>
+    {% for mesg in messages %}
+        <tr>
+            <td>
+                <a href="/view?id={{ mesg.id }}">
+                <span class="icon is-small">
+                    <i class="fa fa-envelope-o"></i>
+                </span>
+                </a>
+            </td>
+            <td>{{ mesg.date.strftime('%Y-%m-%d') }}</td>
+            <td>{{ mesg.from }}</td>
+            <td>{{ mesg.subject }}</td>
+        </tr>
+    {% endfor %}
+    </tbody>
+</table>
+''' + MAIN_FOOTER, user=user, messages=messages)
+
+@app.route('/compose', methods=['GET', 'POST'])
+def compose():
+    user = get_user()
+    if user is None:
+        return redirect(url_for('login'))
+    def render(**context):
+        return render_template_string(MAIN_HEADER + '''
+<h1 class="title">Compose</h1>
+<form method="post">
+    <div class="field">
+        <label class="label">To</label>
+        <div class="control has-icons-left">
+            <input class="input" type="text" name="username" placeholder="Username" value="{{ to }}">
+            <span class="icon is-small is-left">
+                <i class="fa fa-user"></i>
+            </span>
+        </div>
+        <p class="help is-danger">{{ username_error|default('', true) }}</p>
+    </div>
+    <div class="field">
+        <label class="label">Subject</label>
+        <div class="control">
+            <input class="input" type="text" name="subject" placeholder="Subject" value="{{ subject }}">
+        </div>
+        <p class="help is-danger">{{ subject_error|default('', true) }}</p>
+    </div>
+    <div class="field">
+        <label class="label">Message</label>
+        <div class="control">
+            <textarea class="textarea" name="body">{{ body }}</textarea>
+        </div>
+    </div>
+    <div class="level">
+        <div class="level-left">
+        </div>
+        <div class="level-right">
+            <button class="button is-primary">Send</button>
+        </div>
+    </div>
+</form>
+        ''' + MAIN_FOOTER, user=user, **context)
+    if request.method == 'POST':
+        to = request.form.get('username', '')
+        subject = request.form.get('subject', '')
+        body = request.form.get('body', '')
+        errors = {}
+        if not subject:
+            errors['subject_error'] = 'Subject is required.'
+        if not to:
+            errors['username_error'] = 'Recipient is required.'
+        elif not to.isalnum():
+            errors['username_error'] = 'Unknown username.'
+        if errors:
+            return render(to=to, subject=subject, body=body, **errors)
+        c = db().cursor()
+        c.execute('SELECT id FROM users WHERE username = "%s"' % to)
+        row = c.fetchone()
+        if row is None:
+            db().commit()
+            return render(to=to, subject=subject, body=body, username_error='Unknown username.')
+        c.execute('INSERT INTO messages (to_user_id, from_user_id, date, subject, body) VALUES (?, ?, datetime("now"), ?, ?)', (row[0], user['id'], subject, body))
+        db().commit()
+        return redirect(url_for('index'))
+    return render()
+
+@app.route('/view')
+def view():
+    user = get_user()
+    if user is None:
+        return redirect(url_for('login'))
+    mesg = request.args.get('id', '')
+    if not mesg or not mesg.isdigit():
+        return redirect(url_for('index'))
+    c = db().cursor()
+    c.execute('SELECT date, subject, users.name, body FROM messages JOIN users ON messages.from_user_id = users.id WHERE to_user_id = "%d" AND messages.id = "%d"' % (user['id'], int(mesg)))
+    row = c.fetchone()
+    if row is None:
+        return redirect(url_for('index'))
+    return render_template_string(MAIN_HEADER + '''
+<h1 class="title">View</h1>
+    <div class="field">
+        <label class="label">From</label>
+        <div class="control has-icons-left">
+            {{ from_name }}
+        </div>
+    </div>
+    <div class="field">
+        <label class="label">Date</label>
+        <div class="control has-icons-left">
+            {{ date.strftime('%Y-%m-%d') }}
+        </div>
+    </div>
+    <div class="field">
+        <label class="label">Subject</label>
+        <div class="control has-icons-left">
+            {{ subject }}
+        </div>
+    </div>
+    <div class="field">
+        <label class="label">Message</label>
+        <div class="control has-icons-left">
+            <textarea class="textarea" readonly>''' + row[3] + '''</textarea>
+        </div>
+    </div>
+    ''' + MAIN_FOOTER, user=user, from_name=row[2], subject=row[1], date=datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S'))
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    def render(error=None):
+        return render_template_string(HEADER + '''
+<div class="columns">
+    <div class="column is-half is-offset-one-quarter">
+        <h1 class="title">Log in</h1>
+        <form method="post">
+            <div class="field">
+                <label class="label">Username</label>
+                <div class="control has-icons-left">
+                    <input class="input" type="text" name="username">
+                    <span class="icon is-small is-left">
+                        <i class="fa fa-user"></i>
+                    </span>
+                </div>
+            </div>
+            <div class="field">
+                <label class="label">Password</label>
+                <div class="control has-icons-left">
+                    <input class="input" type="text" name="password">
+                    <span class="icon is-small is-left">
+                        <i class="fa fa-lock"></i>
+                    </span>
+                </div>
+            </div>
+            <p class="help is-danger">{{ error|default('', true) }}</p>
+            <div class="level">
+                <div class="level-left">
+                </div>
+                <div class="level-right">
+                    <a class="button is-text" href="/signup">Sign up</a>
+                    <button class="button is-primary">Log in</button>
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
+        ''' + FOOTER, error=error)
+
+    if request.method == 'POST':
+        username = request.form.get('username', None)
+        password = request.form.get('password', None)
+        if not username or not password:
+            return render('Username and password are required.')
+        if not username.isalnum():
+            return render('Wrong username or password.')
+        c = db().cursor()
+        c.execute('SELECT id, password FROM users WHERE username = "%s"' % username)
+        row = c.fetchone()
+        db().commit()
+        if row is None or row[1] != password:
+            return render('Wrong username or password.')
+        session['user_id'] = int(row[0])
+        return redirect(url_for('index'))
+    return render()
+
+@app.route('/signup', methods=['GET', 'POST'])
+def signup():
+    def render(**context):
+        return render_template_string(HEADER + '''
+<div class="columns">
+    <div class="column is-half is-offset-one-quarter">
+        <h1 class="title">Sign up</h1>
+        <form method="post">
+            <div class="field">
+                <label class="label">Name</label>
+                <div class="control">
+                    <input class="input" type="text" name="name">
+                </div>
+                <p class="help is-danger">{{ name_error|default('', true) }}</p>
+            </div>
+            <div class="field">
+                <label class="label">Username</label>
+                <div class="control has-icons-left">
+                    <input class="input" type="text" name="username">
+                    <span class="icon is-small is-left">
+                        <i class="fa fa-user"></i>
+                    </span>
+                </div>
+                <p class="help is-danger">{{ username_error|default('', true) }}</p>
+            </div>
+            <div class="field">
+                <label class="label">Password</label>
+                <div class="control has-icons-left">
+                    <input class="input" type="text" name="password">
+                    <span class="icon is-small is-left">
+                        <i class="fa fa-lock"></i>
+                    </span>
+                </div>
+                <p class="help is-danger">{{ password_error|default('', true) }}</p>
+            </div>
+            <div class="level">
+                <div class="level-left">
+                </div>
+                <div class="level-right">
+                    <button class="button is-primary">Create</button>
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
+        ''' + FOOTER, **context)
+
+    if request.method == 'POST':
+        name = request.form.get('name', '')
+        username = request.form.get('username', '')
+        password = request.form.get('password', '')
+
+        errors = {}
+        if not name:
+            errors['name_error'] = 'Name is required.'
+        if not password:
+            errors['password_error'] = 'Password is required.'
+        if not username:
+            errors['username_error'] = 'Username is required.'
+        elif not username.isalnum():
+            errors['username_error'] = 'Username must be alphanumeric.'
+        if errors:
+            return render(**errors)
+
+        c = db().cursor()
+        c.execute('SELECT id FROM users WHERE username = "%s"' % username)
+        if c.fetchone():
+            db().commit()
+            return render(username_error='Username already exists.')
+        c.execute('INSERT INTO users (name, username, password) VALUES (?, ?, ?)', (name, username, password))
+        db().commit()
+        return redirect(url_for('index'))
+    return render()
+
+@app.cli.command()
+def initdb():
+    c = db().cursor()
+    c.execute('DROP TABLE IF EXISTS users')
+    c.execute('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, username TEXT, password TEXT)')
+    c.execute('INSERT INTO users (name, username, password) VALUES (?, ?, ?)', ('Administrator', 'admin', str(app.config['FLAG'])))
+    c.execute('DROP TABLE IF EXISTS messages')
+    c.execute('CREATE TABLE messages (id INTEGER PRIMARY KEY, to_user_id INTEGER, from_user_id INTEGER, date TEXT, subject TEXT, body TEXT)')
+    db().commit()
